@@ -24,6 +24,7 @@
 // itself controls the USB device
 
 #include <IOKit/hid/IOHIDManager.h>
+#import <IOKit/hidsystem/IOHIDLib.h>
 
 @interface YubiKey ()
 
@@ -32,8 +33,74 @@
      productIDs:(NSString *)productIDs;
 - (void)registerKeyRemovalWithVendorID:(NSString *)vendorID
                             productIDs:(NSString *)productIDs;
+- (void)requestListenAccessOnce;
+- (BOOL)seizeVendorID:(unsigned int)vendorID
+           productIDs:(NSArray<NSNumber *> *)productIDs;
 
 @end
+
+// Devices this process has exclusively opened. The menu-bar app does this
+// itself: on current macOS the root helper's IOHIDDeviceOpen is denied by
+// TCC, and a launch daemon cannot present the Input Monitoring prompt.
+static IOHIDManagerRef seizeManager = NULL;
+static CFMutableSetRef seizedDevices = NULL;
+static BOOL didRequestListenAccess = NO;
+static int lastSeizeError = 0;
+
+static CFDictionaryRef create_match_dict(int vendorID, int productID);
+
+static void seize_one(IOHIDDeviceRef device) {
+    if (device == NULL) {
+        return;
+    }
+    if (seizedDevices != NULL && CFSetContainsValue(seizedDevices, device)) {
+        return;
+    }
+    IOReturn result = IOHIDDeviceOpen(device, kIOHIDOptionsTypeSeizeDevice);
+    if (result == kIOReturnSuccess) {
+        if (seizedDevices == NULL) {
+            seizedDevices = CFSetCreateMutable(kCFAllocatorDefault, 0,
+                                               &kCFTypeSetCallBacks);
+        }
+        CFSetAddValue(seizedDevices, device);
+        lastSeizeError = 0;
+        NSLog(@"Seized YubiKey HID device");
+    } else {
+        lastSeizeError = (int)result;
+    }
+}
+
+static void seize_match_callback(void *context, IOReturn result, void *sender,
+                                 IOHIDDeviceRef device) {
+    seize_one(device);
+}
+
+static void release_seized_devices(void) {
+    if (seizedDevices == NULL) {
+        return;
+    }
+    CFIndex count = CFSetGetCount(seizedDevices);
+    if (count > 0) {
+        IOHIDDeviceRef *devices = calloc((size_t)count, sizeof(IOHIDDeviceRef));
+        CFSetGetValues(seizedDevices, (const void **)devices);
+        for (CFIndex i = 0; i < count; i++) {
+            IOHIDDeviceClose(devices[i], kIOHIDOptionsTypeSeizeDevice);
+        }
+        free(devices);
+    }
+    CFSetRemoveAllValues(seizedDevices);
+}
+
+static void destroy_seize_manager(void) {
+    release_seized_devices();
+    if (seizeManager != NULL) {
+        IOHIDManagerUnscheduleFromRunLoop(seizeManager, CFRunLoopGetMain(),
+                                          kCFRunLoopCommonModes);
+        IOHIDManagerClose(seizeManager, kIOHIDOptionsTypeNone);
+        CFRelease(seizeManager);
+        seizeManager = NULL;
+    }
+}
 
 @implementation YubiKey
 
@@ -49,22 +116,18 @@
          name:@"changeDefaultsPrefs"
          object:nil];
         if (!AXIsProcessTrusted()) {
-            [self raiseAlertWindow:@"yubiswitch requires accessibility access to function. Please enable it in the Security and Privacy prefpane. Taking you there now."];
-            NSString* prefPage = @"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
-            [[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:prefPage]];
+            // Do not block launch on this alert. A modal here used to run
+            // before the key was seized, so the YubiKey kept typing until
+            // somebody dismissed the dialog and toggled the menu.
+            NSLog(@"Accessibility is not granted yet. The global hotkey stays inactive until yubiswitch is enabled for Accessibility.");
+            NSURL *url = [NSURL URLWithString:@"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"];
+            [[NSWorkspace sharedWorkspace] openURL:url];
         }
 
-        if ([self needToInstallHelper:@"com.pallotron.yubiswitch.helper"]) {
-            NSError *error = nil;
-            if (![self blessHelperWithLabel:@"com.pallotron.yubiswitch.helper"
-                                      error:&error]) {
-                [self raiseAlertWindow:
-                 [NSString stringWithFormat:@"Failed to bless helper. Error: %@",
-                  error]];
-                exit(EXIT_FAILURE);
-            }
-        }
-        [self disable];
+        // Do not install or talk to the privileged helper. Seizing the OTP
+        // keyboard requires Input Monitoring, which only a GUI process can
+        // prompt for. The helper replies OK even when TCC denies the open,
+        // which is why the key still typed after launch.
         [self registerKeyRemoval];
     }
     return self;
@@ -234,65 +297,108 @@
              productIDs:[defaults stringForKey:@"hotKeyProductID"]];
 }
 
+- (void)requestListenAccessOnce {
+    if (IOHIDCheckAccess(kIOHIDRequestTypeListenEvent) == kIOHIDAccessTypeGranted) {
+        return;
+    }
+    if (didRequestListenAccess) {
+        return;
+    }
+    didRequestListenAccess = YES;
+    bool granted = IOHIDRequestAccess(kIOHIDRequestTypeListenEvent);
+    NSLog(@"Input Monitoring request granted=%d", granted);
+    if (!granted) {
+        NSURL *url = [NSURL URLWithString:
+                      @"x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent"];
+        [[NSWorkspace sharedWorkspace] openURL:url];
+    }
+}
+
+// Open every matching keyboard that is already plugged in. The matching
+// callback alone is not enough: it is delivered later on the run loop, and a
+// second disable issued before that runs (init plus applicationDidFinishLaunching
+// in older builds) drops the already-connected key.
+- (BOOL)seizeVendorID:(unsigned int)vendorID
+           productIDs:(NSArray<NSNumber *> *)productIDs {
+    [self requestListenAccessOnce];
+
+    if (seizeManager == NULL) {
+        seizeManager = IOHIDManagerCreate(kCFAllocatorDefault, kIOHIDOptionsTypeNone);
+        IOHIDManagerRegisterDeviceMatchingCallback(seizeManager, seize_match_callback,
+                                                   NULL);
+        IOHIDManagerScheduleWithRunLoop(seizeManager, CFRunLoopGetMain(),
+                                        kCFRunLoopCommonModes);
+    }
+
+    CFMutableArrayRef matches =
+        CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
+    if ([productIDs count] == 0) {
+        CFDictionaryRef match = create_match_dict((int)vendorID, 0);
+        CFArrayAppendValue(matches, match);
+        CFRelease(match);
+    } else {
+        for (NSNumber *pid in productIDs) {
+            CFDictionaryRef match = create_match_dict((int)vendorID, [pid intValue]);
+            CFArrayAppendValue(matches, match);
+            CFRelease(match);
+        }
+    }
+    IOHIDManagerSetDeviceMatchingMultiple(seizeManager, matches);
+    CFRelease(matches);
+
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+
+    CFSetRef current = IOHIDManagerCopyDevices(seizeManager);
+    CFIndex present = 0;
+    if (current != NULL) {
+        present = CFSetGetCount(current);
+        if (present > 0) {
+            IOHIDDeviceRef *devices = calloc((size_t)present, sizeof(IOHIDDeviceRef));
+            CFSetGetValues(current, (const void **)devices);
+            for (CFIndex i = 0; i < present; i++) {
+                seize_one(devices[i]);
+            }
+            free(devices);
+        }
+        CFRelease(current);
+    }
+
+    CFIndex held = seizedDevices == NULL ? 0 : CFSetGetCount(seizedDevices);
+    static CFIndex lastLoggedPresent = -1;
+    static CFIndex lastLoggedHeld = -1;
+    if (present != lastLoggedPresent || held != lastLoggedHeld) {
+        NSLog(@"YubiKey seize present=%ld held=%ld lastError=%d",
+              (long)present, (long)held, lastSeizeError);
+        lastLoggedPresent = present;
+        lastLoggedHeld = held;
+    }
+    // No key plugged in: the matcher is armed and will seize it on insert.
+    if (present == 0 || held >= present) {
+        suspend = TRUE;
+        return TRUE;
+    }
+    suspend = FALSE;
+    return FALSE;
+}
+
 - (BOOL)action:(NSString *)action
        vendorID:(NSString *)vendorID
      productIDs:(NSString *)productIDValues {
-    xpc_connection_t connection = xpc_connection_create_mach_service(
-        "com.pallotron.yubiswitch.helper", NULL,
-        XPC_CONNECTION_MACH_SERVICE_PRIVILEGED);
-
-    if (!connection) {
-        [self raiseAlertWindow:@"Failed to create XPC connection with helper"];
-        exit(EXIT_FAILURE);
-    }
-
-    xpc_connection_set_event_handler(connection, ^(xpc_object_t event) {
-        xpc_type_t type = xpc_get_type(event);
-        if (type == XPC_TYPE_ERROR) {
-            if (event == XPC_ERROR_CONNECTION_INTERRUPTED) {
-                // probably helper has been killed, relaunching it?
-                NSLog(@"XPC connection interupted.");
-            } else if (event == XPC_ERROR_CONNECTION_INVALID) {
-                NSLog(@"XPC connection invalid, releasing.");
-            } else {
-                NSLog(@"Unexpected XPC connection error.");
-            }
-        } else {
-            NSLog(@"Unexpected XPC connection event.");
-        }
-    });
-
     unsigned int idVendor = 0;
-    [[NSScanner scannerWithString:vendorID] scanHexInt:&idVendor];
-
+    if ([vendorID isKindOfClass:[NSString class]]) {
+        [[NSScanner scannerWithString:vendorID] scanHexInt:&idVendor];
+    }
     NSArray<NSNumber *> *productIDs = [self parseProductIDs:productIDValues];
 
-    xpc_connection_resume(connection);
-    xpc_object_t message = xpc_dictionary_create(NULL, NULL, 0);
-    xpc_dictionary_set_int64(message, "idVendor", idVendor);
-    // Send the list of product IDs (empty = match all products for the vendor).
-    xpc_object_t products = xpc_array_create(NULL, 0);
-    for (NSNumber *pid in productIDs) {
-        xpc_array_set_int64(products, XPC_ARRAY_APPEND, [pid longLongValue]);
-    }
-    xpc_dictionary_set_value(message, "idProducts", products);
     if ([action isEqualToString:@"enable"]) {
-        xpc_dictionary_set_int64(message, "request", 1);
+        destroy_seize_manager();
         suspend = FALSE;
-    } else if ([action isEqualToString:@"disable"]) {
-        xpc_dictionary_set_int64(message, "request", 0);
-        suspend = TRUE;
+        return TRUE;
     }
-    const char *response = NULL;
-    xpc_object_t event = xpc_connection_send_message_with_reply_sync(connection, message);
-    response = xpc_dictionary_get_string(event, "reply");
-    if (response == NULL) {
-        return FALSE;
+    if ([action isEqualToString:@"disable"]) {
+        return [self seizeVendorID:idVendor productIDs:productIDs];
     }
-    return TRUE;
-    // NSAppleScript *lockScript = [[NSAppleScript alloc]
-    // initWithSource:@"activate application \"ScreenSaverEngine\""];
-    // [lockScript executeAndReturnError:nil];
+    return FALSE;
 }
 
 - (BOOL)state {

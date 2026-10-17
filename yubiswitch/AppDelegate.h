@@ -37,6 +37,9 @@
     AboutWindowController* aboutwc;
     PreferencesController* prefwc;
     NSTimer* reDisableTimer;
+    NSTimer* startupDisableTimer;
+    int startupDisableAttempts;
+    bool startupUserOverride;
     ComputerStateMonitor* state_monitor;
 }
 

@@ -67,16 +67,70 @@
         }
     }
 }
+- (void)showYubiKeyEnabled:(BOOL)enabled {
+    if (enabled) {
+        [statusItem setToolTip:(@"YubiKey enabled")];
+        [statusItem setImage:[NSImage imageNamed:@"YubikeyEnabled"]];
+        [statusItem.button setImage:[NSImage imageNamed:@"YubikeyEnabled"]];
+        [statusItem.button setToolTip:@"YubiKey enabled"];
+        isEnabled = true;
+        [[statusMenu itemAtIndex:0] setState:1];
+    } else {
+        [statusItem setToolTip:(@"YubiKey disabled")];
+        [statusItem setImage:[NSImage imageNamed:@"YubikeyDisabled"]];
+        [statusItem.button setImage:[NSImage imageNamed:@"YubikeyDisabled"]];
+        [statusItem.button setToolTip:@"YubiKey disabled"];
+        isEnabled = false;
+        [[statusMenu itemAtIndex:0] setState:0];
+    }
+}
+
+// Keep trying until the key that is already plugged in is actually seized.
+// A single attempt at launch used to report success before the open finished,
+// so the menu said "disabled" while touches still typed a one-time password.
+- (void)attemptStartupDisable:(NSTimer *)timer {
+    if (startupUserOverride) {
+        [startupDisableTimer invalidate];
+        startupDisableTimer = nil;
+        return;
+    }
+    startupDisableAttempts++;
+    if ([yk disable]) {
+        [startupDisableTimer invalidate];
+        startupDisableTimer = nil;
+        [self showYubiKeyEnabled:NO];
+        [self notify:@"YubiKey disabled"];
+        return;
+    }
+    [self showYubiKeyEnabled:YES];
+    if (startupDisableAttempts == 1) {
+        [self notify:@"YubiKey is still enabled. Allow Input Monitoring for yubiswitch."];
+    }
+    if (startupDisableTimer == nil && startupDisableAttempts == 1) {
+        startupDisableTimer =
+        [NSTimer scheduledTimerWithTimeInterval:1
+                                         target:self
+                                       selector:@selector(attemptStartupDisable:)
+                                       userInfo:nil
+                                        repeats:YES];
+    }
+    if (startupDisableAttempts >= 600) {
+        [startupDisableTimer invalidate];
+        startupDisableTimer = nil;
+    }
+}
+
 - (void)applicationDidFinishLaunching:(NSNotification *)aNotification {
     yk = [[YubiKey alloc] init];
-    [yk disable];
     state_monitor = [[ComputerStateMonitor alloc] initWithYubiKey:yk];
     usernotification = [[NSUserNotification alloc] init];
-    [self notify:@"YubiKey disabled"];
     aboutwc = [[AboutWindowController alloc]
                initWithWindowNibName:@"AboutWindowController"];
     prefwc = [[PreferencesController alloc]
               initWithWindowNibName:@"PreferencesController"];
+    startupDisableAttempts = 0;
+    startupUserOverride = false;
+    [self attemptStartupDisable:nil];
 }
 
 - (void)awakeFromNib {
@@ -158,14 +212,25 @@
                                            repeats:NO];
 }
 
+- (NSInteger)switchOffSeconds:(id)raw {
+    if ([raw isKindOfClass:[NSNumber class]]) {
+        return [(NSNumber *)raw integerValue];
+    }
+    if ([raw isKindOfClass:[NSString class]]) {
+        NSNumberFormatter *formatter = [[NSNumberFormatter alloc] init];
+        [formatter setNumberStyle:NSNumberFormatterDecimalStyle];
+        NSNumber *parsed = [formatter numberFromString:(NSString *)raw];
+        if (parsed != nil) {
+            return [parsed integerValue];
+        }
+        return [(NSString *)raw integerValue];
+    }
+    return 0;
+}
+
 - (void)reDisableYK {
-    BOOL res;
-    res = [yk disable];
-    if (res == TRUE) {
-        [statusItem setToolTip:(@"YubiKey disabled")];
-        [statusItem setImage:[NSImage imageNamed:@"YubikeyDisabled"]];
-        isEnabled = false;
-        [[statusMenu itemAtIndex:0] setState:0];
+    if ([yk disable]) {
+        [self showYubiKeyEnabled:NO];
         [self notify:@"YubiKey disabled"];
     }
 }
@@ -180,29 +245,26 @@
     if (res == TRUE) {
         [reDisableTimer invalidate];
         reDisableTimer = nil;
+        [self showYubiKeyEnabled:enable];
         if (enable == TRUE) {
-            [statusItem setToolTip:(@"YubiKey enabled")];
-            [statusItem setImage:[NSImage imageNamed:@"YubikeyEnabled"]];
-            isEnabled = true;
-            [[statusMenu itemAtIndex:0] setState:1];
             [self notify:@"YubiKey enabled"];
             NSDictionary *switchOffDelayPrefs = [[NSUserDefaults standardUserDefaults]
                                                  dictionaryForKey:@"switchOffDelay"];
             bool enabled = [[switchOffDelayPrefs valueForKey:@"enabled"] boolValue];
             if (enabled == TRUE) {
-                NSNumberFormatter *f = [[NSNumberFormatter alloc] init];
-                [f setNumberStyle:NSNumberFormatterDecimalStyle];
-                NSNumber *interval =
-                [f numberFromString:[switchOffDelayPrefs valueForKey:@"interval"]];
-                reDisableTimer = [self createTimer:(long)[interval integerValue]];
+                NSInteger seconds = [self switchOffSeconds:
+                                     [switchOffDelayPrefs valueForKey:@"interval"]];
+                if (seconds < 1) {
+                    seconds = 1;
+                }
+                reDisableTimer = [self createTimer:seconds];
             }
         } else {
-            [statusItem setToolTip:(@"YubiKey disabled")];
-            [statusItem setImage:[NSImage imageNamed:@"YubikeyDisabled"]];
-            isEnabled = false;
-            [[statusMenu itemAtIndex:0] setState:0];
             [self notify:@"YubiKey disabled"];
         }
+    } else if (enable == FALSE) {
+        [self showYubiKeyEnabled:YES];
+        [self notify:@"YubiKey is still enabled. Allow Input Monitoring for yubiswitch."];
     }
 }
 
@@ -215,6 +277,9 @@
 }
 
 - (IBAction)toggle:(id)sender {
+    startupUserOverride = true;
+    [startupDisableTimer invalidate];
+    startupDisableTimer = nil;
     if (isEnabled == TRUE) {
         [self enableYubiKey:FALSE];
     } else {
